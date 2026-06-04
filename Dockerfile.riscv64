@@ -1,0 +1,264 @@
+# syntax=docker/dockerfile:1
+#
+# EXPERIMENTAL riscv64 build of Hermes. NOT a drop-in for the production
+# multi-arch Dockerfile — it is a standalone variant meant to be built
+# natively on real riscv64 hardware (e.g. Banana Pi F3 / SpacemiT K1) so we
+# can discover, one layer at a time, where a riscv64 image actually breaks.
+#
+#   docker build -f Dockerfile.riscv64 -t hermes:riscv64 .
+#
+# Why a separate file instead of TARGETARCH branches in the main Dockerfile:
+# the production image sources `uv` and `node` via `COPY --from=<image>`
+# stages whose manifests have no riscv64 variant, and a Dockerfile COPY
+# cannot be made conditional on an ARG. Rather than restructure (and risk)
+# the working amd64/arm64 build, this variant downloads those two binaries
+# directly. Once it builds and runs on hardware, the deltas can be folded
+# back into Dockerfile with a multi-stage select.
+#
+# Known divergences from Dockerfile (all marked `# riscv64:` below):
+#   1. No uv_source / node_source FROM stages — uv and node are fetched as
+#      checksum-pinned tarballs (uv from GitHub, node from unofficial-builds
+#      because nodejs.org/dist ships no riscv64 binary).
+#   2. s6-overlay uses the upstream riscv64 tarball.
+#   3. A Rust + C build toolchain is installed because there are no
+#      manylinux riscv64 wheels for the native deps (pydantic-core,
+#      tokenizers, cryptography, numpy, pynacl, …) — uv compiles them from
+#      sdist. Expect this layer to be slow even on native hardware.
+#   4. Playwright Chromium is NOT installed: no riscv64 browser build exists
+#      upstream. Browser-automation features are unavailable in this image.
+#   5. The web dashboard is NOT built in-image. Tailwind v4's Vite pipeline
+#      pulls lightningcss + @tailwindcss/oxide, Rust/napi modules with no
+#      riscv64 binary on npm, and there is no riscv64 `node` base image to
+#      build them under anyway (node:22 has no riscv64 manifest). The
+#      dashboard output (hermes_cli/web_dist) is arch-independent static
+#      assets, so it is built once on amd64 and injected via the build
+#      context; absent that, the image ships dashboard-less (the dashboard
+#      service is gated off by default). See the web_dist note before the
+#      source COPY below.
+#
+# Debian trixie is an official RISC-V port, so the runtime base is unchanged.
+
+FROM debian:13.4
+
+# Disable Python stdout buffering to ensure logs are printed immediately
+ENV PYTHONUNBUFFERED=1
+
+# Store Playwright browsers outside the volume mount so the build-time
+# install survives the /opt/data volume overlay at runtime. Kept for parity
+# even though no browser is installed on riscv64 (see divergence #4).
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
+
+# Install system dependencies in one layer, clear APT cache.
+# riscv64: extra packages vs the production Dockerfile —
+#   make g++            : node-gyp compiles native npm addons from source
+#                         (no riscv64 prebuilds) and needs a full C/C++ chain.
+#   pkg-config libssl-dev: cryptography's Rust build links system OpenSSL.
+#   libolm-dev          : Matrix E2EE (python-olm via mautrix[encryption]) is a
+#                         runtime lazy-install with no riscv64 wheel, so it
+#                         compiles from sdist and needs the olm headers (parity
+#                         with the production Dockerfile).
+# Rust itself comes from rustup (installed below), NOT Debian: trixie ships
+# rustc 1.85.0, which is too old for `davey` (Discord DAVE voice E2EE via the
+# openmls crate) — openmls uses `unsigned_is_multiple_of`, stabilized in Rust
+# 1.87. The maturin/Cython builds of cffi, pynacl, uvloop, httptools, jiter,
+# cryptography, watchfiles, etc. all run against the rustup toolchain.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg \
+    gcc g++ make python3-dev python3-venv libffi-dev libolm-dev procps git openssh-client \
+    docker-cli xz-utils pkg-config libssl-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# ---------- s6-overlay install ----------
+# riscv64: upstream s6-overlay publishes a first-class riscv64 tarball, so
+# this is the same flow as the production image with the arch hardcoded and
+# the riscv64 checksum pinned (fetched from the v3.2.3.0 .sha256 assets).
+ARG S6_OVERLAY_VERSION=3.2.3.0
+ARG S6_OVERLAY_NOARCH_SHA256=b720f9d9340efc8bb07528b9743813c836e4b02f8693d90241f047998b4c53cf
+ARG S6_OVERLAY_RISCV64_SHA256=a4a4ed5eb17562879d07189cc4b3b9cd146c2d88855792fa95d99e0decbfcaf8
+ARG S6_OVERLAY_SYMLINKS_SHA256=a60dc5235de3ecbcf874b9c1f18d73263ab99b289b9329aa950e8729c4789f0e
+ADD https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-noarch.tar.xz /tmp/
+ADD https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-symlinks-noarch.tar.xz /tmp/
+RUN set -eu; \
+    curl -fsSL --retry 3 -o /tmp/s6-overlay-arch.tar.xz \
+        "https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-riscv64.tar.xz"; \
+    { \
+        printf '%s  %s\n' "${S6_OVERLAY_NOARCH_SHA256}" /tmp/s6-overlay-noarch.tar.xz; \
+        printf '%s  %s\n' "${S6_OVERLAY_RISCV64_SHA256}" /tmp/s6-overlay-arch.tar.xz; \
+        printf '%s  %s\n' "${S6_OVERLAY_SYMLINKS_SHA256}" /tmp/s6-overlay-symlinks-noarch.tar.xz; \
+    } > /tmp/s6-overlay.sha256; \
+    sha256sum -c /tmp/s6-overlay.sha256; \
+    tar -C / -Jxpf /tmp/s6-overlay-noarch.tar.xz; \
+    tar -C / -Jxpf /tmp/s6-overlay-arch.tar.xz; \
+    tar -C / -Jxpf /tmp/s6-overlay-symlinks-noarch.tar.xz; \
+    rm /tmp/s6-overlay-*.tar.xz /tmp/s6-overlay.sha256; \
+    ln -sf /init /usr/bin/tini
+
+# Non-root user for runtime; UID can be overridden via HERMES_UID at runtime
+RUN useradd -u 10000 -m -d /opt/data hermes
+
+# ---------- uv (riscv64) ----------
+# riscv64: production copies uv from ghcr.io/astral-sh/uv (no riscv64
+# manifest). Astral does publish a standalone riscv64 binary, so fetch and
+# verify it. Tarball layout: uv-riscv64gc-unknown-linux-gnu/{uv,uvx}.
+ARG UV_VERSION=0.11.6
+ARG UV_RISCV64_SHA256=0e3ead8667b51b07b5fb9d114bcd1914a5fe3159e6959a584dc2f89c6724e123
+RUN set -eu; \
+    curl -fsSL --retry 3 -o /tmp/uv.tar.gz \
+        "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-riscv64gc-unknown-linux-gnu.tar.gz"; \
+    printf '%s  %s\n' "${UV_RISCV64_SHA256}" /tmp/uv.tar.gz | sha256sum -c; \
+    tar -C /usr/local/bin --strip-components=1 -xzf /tmp/uv.tar.gz \
+        uv-riscv64gc-unknown-linux-gnu/uv uv-riscv64gc-unknown-linux-gnu/uvx; \
+    chmod 0755 /usr/local/bin/uv /usr/local/bin/uvx; \
+    rm /tmp/uv.tar.gz; \
+    uv --version
+
+# ---------- Node 22 (riscv64, unofficial-builds) ----------
+# riscv64: nodejs.org/dist ships NO riscv64 binary. The Node project's
+# `unofficial-builds` sub-project cross-compiles riscv64 on Ubuntu 24.04
+# (glibc 2.39) — that runs cleanly on trixie (glibc 2.41). This pins a
+# specific patch (22.22.3) independent of the bookworm node:22 tag the
+# production image tracks. Extracting the whole prefix gives a complete,
+# correctly-symlinked node/npm/npx/corepack install (and node headers for
+# node-gyp), so the production COPY+symlink dance is unnecessary here.
+ARG NODE_VERSION=22.22.3
+ARG NODE_RISCV64_SHA256=7a2c78e87eb154d450c5cccc6f9a8b3de1a0854ee78f3ef92a2d7e4c71d4985f
+RUN set -eu; \
+    curl -fsSL --retry 3 -o /tmp/node.tar.xz \
+        "https://unofficial-builds.nodejs.org/download/release/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-riscv64.tar.xz"; \
+    printf '%s  %s\n' "${NODE_RISCV64_SHA256}" /tmp/node.tar.xz | sha256sum -c; \
+    tar -C /usr/local --strip-components=1 \
+        --exclude='*/CHANGELOG.md' --exclude='*/LICENSE' --exclude='*/README.md' \
+        -xJf /tmp/node.tar.xz; \
+    rm /tmp/node.tar.xz; \
+    node --version && npm --version
+
+# ---------- Rust toolchain (riscv64, rustup) ----------
+# riscv64: Debian's rustc 1.85.0 can't build `davey`/openmls (needs the 1.87
+# `unsigned_is_multiple_of`). rustup publishes a first-class riscv64gc host
+# toolchain, so use it for every sdist that compiles Rust during `uv sync`.
+# Installed system-wide under /usr/local so both the root build and the hermes
+# user can reach cargo. The toolchain is pinned (RUST_VERSION) for reproducible
+# builds — this is the version validated on hardware; it must stay >= 1.87 for
+# openmls. The installer is downloaded to disk and then run (not piped into a
+# shell) so a truncated download can't be masked by sh's lack of pipefail,
+# matching the uv/node/s6 fetches above.
+ENV RUSTUP_HOME=/usr/local/rustup
+ENV CARGO_HOME=/usr/local/cargo
+ENV PATH=/usr/local/cargo/bin:${PATH}
+ARG RUST_VERSION=1.96.0
+RUN set -eu; \
+    curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o /tmp/rustup-init.sh https://sh.rustup.rs; \
+    sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain "${RUST_VERSION}" --no-modify-path; \
+    rm /tmp/rustup-init.sh; \
+    chmod -R a+rX "${RUSTUP_HOME}" "${CARGO_HOME}"; \
+    rustc --version && cargo --version
+
+WORKDIR /opt/hermes
+
+# ---------- Layer-cached dependency install ----------
+# See production Dockerfile for the workspace-copy rationale; identical here.
+COPY package.json package-lock.json ./
+COPY web/package.json web/
+COPY ui-tui/package.json ui-tui/
+COPY ui-tui/packages/hermes-ink/ ui-tui/packages/hermes-ink/
+
+ENV npm_config_install_links=false
+
+# riscv64: Playwright Chromium has no riscv64 build, so the production
+# `npx playwright install --with-deps chromium` step is omitted — it would
+# hard-fail. npm install still runs so the TUI and dashboard build inputs
+# are present. Browser-automation features are disabled in this image.
+# PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD guards any transitive postinstall that
+# would otherwise try to pull a browser.
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+RUN npm install --prefer-offline --no-audit && \
+    npm cache clean --force
+
+# ---------- Layer-cached Python dependency install ----------
+# riscv64: this is THE expensive, failure-prone layer. With no manylinux
+# riscv64 wheels available, `uv sync --frozen` builds every native extension
+# from sdist using the Rust + C toolchains installed above. Expect long
+# compiles (tokenizers / pydantic-core / cryptography are the heavy ones) and
+# watch here first when the build fails — a missing sdist or an unbuildable
+# crate surfaces at this step.
+#
+# riscv64 divergence: the production image uses `--extra all`, which composes
+# in `[dev]` (ty + ruff + pytest). `ty==0.0.21` is a maturin/Rust build of
+# the ruff workspace that requires rustc > 1.85; Debian trixie ships exactly
+# 1.85.0, so it fails to build (`rustc 1.85.0 is not supported`). ty/ruff are
+# dev/CI type-checking tools with no runtime role, so we enumerate `[all]`
+# MINUS `[dev]` here instead of pulling a newer Rust just to compile two dev
+# tools. To restore parity, install a newer toolchain (rustup stable) before
+# this step and append `--extra dev`. The omitted dev tools (ty, ruff) are
+# logged as RISC-V source-build candidates for the rise-sponsorship tracker.
+COPY pyproject.toml uv.lock ./
+# pyproject.toml's `readme =` field points at README.md, which .dockerignore's
+# `*.md` rule excludes from the build context. The `uv sync` step below stats
+# that path while resolving deps, so stand in an empty placeholder. Safe: it is
+# overwritten by the real README in `COPY . .` further down, before the file is
+# ever read. Permanent by design (mirrors the main Dockerfile's identical
+# `touch`); not a temporary workaround, since the `*.md` exclusion is
+# intentional, so no removal TODO.
+RUN touch ./README.md
+RUN uv sync --frozen --no-install-project \
+    --extra cron --extra cli --extra pty --extra mcp --extra homeassistant \
+    --extra sms --extra acp --extra google --extra web --extra youtube \
+    --extra messaging --extra anthropic --extra bedrock --extra azure-identity \
+    --extra hindsight
+
+# ---------- Source code ----------
+COPY --chown=hermes:hermes . .
+
+# Web dashboard: the source COPY above already carries hermes_cli/web_dist
+# (vite's outDir, which HERMES_WEB_DIST points at) IF it was pre-built into the
+# build context. It can't be built here (Tailwind v4's lightningcss +
+# @tailwindcss/oxide have no riscv64 napi binary, and there is no riscv64 node
+# base image to build them under). The output is arch-independent, so build it
+# once on amd64 (`cd web && npm run build`) and drop hermes_cli/web_dist into
+# the context before building; CI does this with an amd64 artifact. Without it,
+# the dir is simply absent and the image is dashboard-less (the dashboard
+# service is gated off by default via HERMES_DASHBOARD).
+
+# Terminal UI assets build natively: ui-tui uses esbuild, which has first-class
+# riscv64 support (verified building cleanly on the K1).
+RUN cd /opt/hermes/ui-tui && npm run build && echo "RISCV64_TUI_BUILD=ok"
+
+# ---------- Permissions ----------
+USER root
+RUN chmod -R a+rX /opt/hermes && \
+    chown -R hermes:hermes /opt/hermes/.venv /opt/hermes/ui-tui /opt/hermes/gateway /opt/hermes/node_modules
+
+# ---------- Link hermes-agent itself (editable) ----------
+RUN uv pip install --no-cache-dir --no-deps -e "."
+
+# ---------- Bake build-time git revision ----------
+ARG HERMES_GIT_SHA=
+RUN if [ -n "${HERMES_GIT_SHA}" ]; then \
+        printf '%s\n' "${HERMES_GIT_SHA}" > /opt/hermes/.hermes_build_sha && \
+        chown hermes:hermes /opt/hermes/.hermes_build_sha; \
+    fi
+
+# ---------- s6-overlay service wiring ----------
+COPY docker/s6-rc.d/ /etc/s6-overlay/s6-rc.d/
+
+RUN mkdir -p /etc/cont-init.d && \
+    printf '#!/command/with-contenv sh\nexec /opt/hermes/docker/stage2-hook.sh\n' \
+        > /etc/cont-init.d/01-hermes-setup && \
+    chmod +x /etc/cont-init.d/01-hermes-setup
+COPY --chmod=0755 docker/cont-init.d/015-supervise-perms /etc/cont-init.d/015-supervise-perms
+COPY --chmod=0755 docker/cont-init.d/02-reconcile-profiles /etc/cont-init.d/02-reconcile-profiles
+
+# ---------- Runtime ----------
+ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
+ENV HERMES_TUI_DIR=/opt/hermes/ui-tui
+ENV HERMES_HOME=/opt/data
+
+COPY --chmod=0755 docker/hermes-exec-shim.sh /opt/hermes/bin/hermes
+
+ENV PATH="/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:${PATH}"
+RUN mkdir -p /opt/data
+VOLUME [ "/opt/data" ]
+
+ENTRYPOINT [ "/init", "/opt/hermes/docker/main-wrapper.sh" ]
+CMD [ ]
