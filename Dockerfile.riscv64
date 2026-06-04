@@ -49,7 +49,7 @@
 #     like the Playwright omission). Pre-build web_dist on amd64 to include it.
 #
 # lightningcss + @tailwindcss/oxide are logged as RISE riscv64 napi candidates.
-FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS web-builder
+FROM --platform=$BUILDPLATFORM node:22-bookworm-slim@sha256:7af03b14a13c8cdd38e45058fd957bf00a72bbe17feac43b1c15a689c029c732 AS web-builder
 WORKDIR /opt/hermes
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 ENV npm_config_install_links=false
@@ -203,11 +203,16 @@ RUN npm install --prefer-offline --no-audit && \
 # this step and append `--extra dev`. The omitted dev tools (ty, ruff) are
 # logged as RISC-V source-build candidates for the rise-sponsorship tracker.
 COPY pyproject.toml uv.lock ./
+# pyproject.toml's `readme =` field points at README.md, which .dockerignore's
+# `*.md` rule excludes from the build context. uv stats that path during dep
+# resolution, so stand in an empty placeholder (same workaround as the main
+# Dockerfile); the real README returns with `COPY . .` below.
 RUN touch ./README.md
 RUN uv sync --frozen --no-install-project \
     --extra cron --extra cli --extra pty --extra mcp --extra homeassistant \
     --extra sms --extra acp --extra google --extra web --extra youtube \
-    --extra messaging --extra anthropic --extra bedrock --extra azure-identity
+    --extra messaging --extra anthropic --extra bedrock --extra azure-identity \
+    --extra hindsight
 
 # ---------- Source code ----------
 COPY --chown=hermes:hermes . .
@@ -227,7 +232,7 @@ RUN cd /opt/hermes/ui-tui && npm run build && echo "RISCV64_TUI_BUILD=ok"
 # ---------- Permissions ----------
 USER root
 RUN chmod -R a+rX /opt/hermes && \
-    chown -R hermes:hermes /opt/hermes/.venv /opt/hermes/ui-tui /opt/hermes/node_modules
+    chown -R hermes:hermes /opt/hermes/.venv /opt/hermes/ui-tui /opt/hermes/gateway /opt/hermes/node_modules
 
 # ---------- Link hermes-agent itself (editable) ----------
 RUN uv pip install --no-cache-dir --no-deps -e "."
