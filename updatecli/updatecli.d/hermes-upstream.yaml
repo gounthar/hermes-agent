@@ -1,0 +1,68 @@
+---
+name: Track NousResearch/hermes-agent upstream releases
+
+# Detect new upstream Hermes releases and bump .upstream-version, which the
+# release-riscv64 workflow consumes to build + publish the riscv64 image.
+#
+# Upstream tags are CalVer (e.g. v2026.5.29.2, four numeric parts), NOT semver.
+# A semver versionfilter would reject them ("no valid semantic version found"),
+# so this uses `kind: latest` — GitHub's own Latest-release pointer — which
+# returns the tag verbatim without parsing it as semver.
+
+scms:
+  default:
+    kind: github
+    spec:
+      owner: gounthar
+      repository: hermes-agent
+      token: '{{ requiredEnv "UPDATECLI_GITHUB_TOKEN" }}'
+      username: gounthar
+      branch: main
+
+sources:
+  upstreamRelease:
+    name: Latest upstream release tag
+    kind: githubrelease
+    spec:
+      owner: NousResearch
+      repository: hermes-agent
+      token: '{{ requiredEnv "UPDATECLI_GITHUB_TOKEN" }}'
+      versionfilter:
+        kind: latest
+
+targets:
+  upstreamVersion:
+    name: Bump .upstream-version to the latest upstream tag
+    kind: file
+    sourceid: upstreamRelease
+    spec:
+      file: .upstream-version
+      forcecreate: true
+    scmid: default
+
+actions:
+  default:
+    kind: github/pullrequest
+    scmid: default
+    spec:
+      # mergemethod (how: squash/merge/rebase) is a TOP-LEVEL field; the merge
+      # sub-struct only has strategy (when: auto/client/manual) and after.
+      mergemethod: squash
+      merge:
+        strategy: auto
+      title: 'chore: sync upstream Hermes {{ source "upstreamRelease" }}'
+      labels:
+        - riscv64
+        - upstream-sync
+      description: |
+        Automated by updatecli: a new upstream release was detected.
+
+        This PR auto-merges (squash). The merge pushes .upstream-version to
+        main, which triggers the `release-riscv64` workflow to build and
+        publish the riscv64 image for this version to Docker Hub and GHCR.
+
+        Prerequisites on this repo for hands-off operation:
+        - Settings -> General -> "Allow auto-merge" enabled.
+        - A branch-protection rule on `main` with at least one required
+          status check, so GitHub auto-merge engages (and the merge is gated
+          on that check passing) rather than the PR being instantly mergeable.
