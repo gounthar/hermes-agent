@@ -65,10 +65,12 @@ jobs:
   image:
     name: Build and push riscv64 image
     needs: dashboard
-    # TODO: set this to your RISE riscv64 runner label(s). Native riscv64 is
-    # required (the from-source Rust compiles are ~40 min native vs hours under
-    # QEMU). Example for a self-hosted RISE runner registered with these labels:
-    runs-on: [self-hosted, linux, riscv64]
+    # RISE's free, managed, native riscv64 runner. Requires the repo to be
+    # enrolled in the RISE runner program (the RISE GitHub App installed on
+    # this repo, see riseproject.dev); otherwise this label won't resolve.
+    # Native riscv64 is required: the from-source Rust compiles are ~40 min
+    # native vs hours under QEMU.
+    runs-on: ubuntu-24.04-riscv
     steps:
       - name: Checkout
         uses: actions/checkout@v5
