@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   updatecli:
-    name: updatecli apply
+    name: updatecli pipeline apply
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
