@@ -1,0 +1,144 @@
+---
+name: Release riscv64 image
+
+# Build and publish a linux/riscv64 Hermes image to Docker Hub and GHCR.
+# Upstream (NousResearch/hermes-agent) ships linux/amd64 + linux/arm64 only,
+# so this fills the riscv64 gap.
+#
+# The web dashboard CANNOT be built on riscv64: Tailwind v4's Vite pipeline
+# pulls lightningcss + @tailwindcss/oxide, Rust/napi modules with no riscv64
+# binary on npm, and there is no riscv64 `node` base image to build them under.
+# Its output (hermes_cli/web_dist) is arch-independent static assets, so a
+# dedicated amd64 job builds it and hands it to the riscv64 build as an
+# artifact (injected through the build context; Dockerfile.riscv64's `COPY . .`
+# picks it up). See Dockerfile.riscv64 divergence #5.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (e.g. v0.15.1). Defaults to .upstream-version."
+        required: false
+        type: string
+  repository_dispatch:
+    types: [upstream-release]
+  push:
+    branches: [main]
+    paths:
+      - .upstream-version
+      - Dockerfile.riscv64
+      - .github/workflows/release-riscv64.yml
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  DOCKERHUB_IMAGE: docker.io/gounthar/hermes-agent
+  GHCR_IMAGE: ghcr.io/gounthar/hermes-agent
+
+jobs:
+  dashboard:
+    name: Build web dashboard (amd64)
+    runs-on: ubuntu-latest
+    env:
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Set up Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+      - name: Build dashboard (vite outDir -> hermes_cli/web_dist)
+        run: |
+          npm install --prefer-offline --no-audit
+          npm run build --workspace web
+      - name: Upload web_dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: hermes_cli/web_dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  image:
+    name: Build and push riscv64 image
+    needs: dashboard
+    # TODO: set this to your RISE riscv64 runner label(s). Native riscv64 is
+    # required (the from-source Rust compiles are ~40 min native vs hours under
+    # QEMU). Example for a self-hosted RISE runner registered with these labels:
+    runs-on: [self-hosted, linux, riscv64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Resolve and validate version
+        id: ver
+        # Inputs come in via env (never interpolated into the shell) because
+        # client_payload.* is attacker-controllable on repository_dispatch.
+        # The resolved value is then validated against a strict version pattern
+        # before it is ever used in a tag or shell command.
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          DISPATCH_VERSION: ${{ github.event.client_payload.version }}
+        run: |
+          v="${INPUT_VERSION}"
+          [ -z "$v" ] && v="${DISPATCH_VERSION}"
+          [ -z "$v" ] && v="$(cat .upstream-version 2>/dev/null || true)"
+          if [ -z "$v" ]; then
+            echo "::error::No version resolved (input, dispatch payload, and .upstream-version all empty)"
+            exit 1
+          fi
+          v="${v#v}"
+          if ! printf '%s' "$v" | grep -Eq '^[0-9]+\.[0-9]+(\.[0-9]+)?([.-][0-9A-Za-z.]+)?$'; then
+            echo "::error::Refusing unexpected version string"
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - name: Download web dashboard
+        uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: hermes_cli/web_dist
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build image
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          docker build -f Dockerfile.riscv64 \
+            --build-arg HERMES_GIT_SHA="${GITHUB_SHA}" \
+            -t "${DOCKERHUB_IMAGE}:${VERSION}-riscv64" \
+            -t "${DOCKERHUB_IMAGE}:riscv64" \
+            -t "${GHCR_IMAGE}:${VERSION}-riscv64" \
+            -t "${GHCR_IMAGE}:riscv64" \
+            .
+      - name: Smoke test
+        run: docker run --rm "${GHCR_IMAGE}:riscv64" --version
+      - name: Push images
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          docker push "${DOCKERHUB_IMAGE}:${VERSION}-riscv64"
+          docker push "${DOCKERHUB_IMAGE}:riscv64"
+          docker push "${GHCR_IMAGE}:${VERSION}-riscv64"
+          docker push "${GHCR_IMAGE}:riscv64"
+      - name: Summary
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          {
+            echo "### riscv64 image published";
+            echo "";
+            echo "- \`${DOCKERHUB_IMAGE}:${VERSION}-riscv64\`";
+            echo "- \`${GHCR_IMAGE}:${VERSION}-riscv64\`";
+          } >> "$GITHUB_STEP_SUMMARY"
