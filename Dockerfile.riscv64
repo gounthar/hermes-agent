@@ -26,38 +26,17 @@
 #      sdist. Expect this layer to be slow even on native hardware.
 #   4. Playwright Chromium is NOT installed: no riscv64 browser build exists
 #      upstream. Browser-automation features are unavailable in this image.
-#   5. The web dashboard is compiled in a `--platform=$BUILDPLATFORM` builder
-#      stage and copied in, because Tailwind v4's lightningcss +
-#      @tailwindcss/oxide napi binaries have no riscv64 build (see below).
+#   5. The web dashboard is NOT built in-image. Tailwind v4's Vite pipeline
+#      pulls lightningcss + @tailwindcss/oxide, Rust/napi modules with no
+#      riscv64 binary on npm, and there is no riscv64 `node` base image to
+#      build them under anyway (node:22 has no riscv64 manifest). The
+#      dashboard output (hermes_cli/web_dist) is arch-independent static
+#      assets, so it is built once on amd64 and injected via the build
+#      context; absent that, the image ships dashboard-less (the dashboard
+#      service is gated off by default). See the web_dist note before the
+#      source COPY below.
 #
 # Debian trixie is an official RISC-V port, so the runtime base is unchanged.
-
-# ---------- Web dashboard builder (cross-arch) ----------
-# riscv64: the dashboard uses Tailwind CSS v4, whose Vite pipeline pulls two
-# Rust/napi modules with NO riscv64 binary on npm — `lightningcss`
-# (no lightningcss-linux-riscv64-gnu) and `@tailwindcss/oxide`
-# (no @tailwindcss/oxide-linux-riscv64-gnu). The build OUTPUT
-# (hermes_cli/web_dist, vite's outDir) is arch-independent static assets, so we
-# compile it on the BUILD host's arch and COPY it into the riscv64 stage:
-#
-#   * `buildx --platform linux/riscv64` from an amd64 host → $BUILDPLATFORM is
-#     amd64, the dashboard builds natively here, and the riscv64 image gets the
-#     full UI. This is the intended production path.
-#   * a native riscv64-only `docker build` on the board → $BUILDPLATFORM is
-#     riscv64, the napi build fails, and the `||` fallback leaves an empty
-#     web_dist so the build still succeeds (image ships without the bundled UI,
-#     like the Playwright omission). Pre-build web_dist on amd64 to include it.
-#
-# lightningcss + @tailwindcss/oxide are logged as RISE riscv64 napi candidates.
-FROM --platform=$BUILDPLATFORM node:22-bookworm-slim@sha256:7af03b14a13c8cdd38e45058fd957bf00a72bbe17feac43b1c15a689c029c732 AS web-builder
-WORKDIR /opt/hermes
-ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
-ENV npm_config_install_links=false
-COPY . .
-RUN npm install --prefer-offline --no-audit && \
-    { cd web && npm run build && echo "WEB_DIST_BUILT=ok"; } || \
-    { mkdir -p /opt/hermes/hermes_cli/web_dist; \
-      echo "WEB_DIST_BUILT=skipped (riscv64 napi gap — pre-build web_dist on amd64)"; }
 
 FROM debian:13.4
 
@@ -217,13 +196,15 @@ RUN uv sync --frozen --no-install-project \
 # ---------- Source code ----------
 COPY --chown=hermes:hermes . .
 
-# Web dashboard: copy the arch-independent build output produced by the
-# web-builder stage above (vite's outDir is hermes_cli/web_dist, which
-# HERMES_WEB_DIST points at). Built on the BUILD host arch to dodge the
-# Tailwind v4 lightningcss/@tailwindcss-oxide riscv64 napi gap. On a native
-# riscv64-only build this dir is empty (dashboard not bundled); on an amd64
-# buildx build it carries the full UI.
-COPY --from=web-builder /opt/hermes/hermes_cli/web_dist /opt/hermes/hermes_cli/web_dist
+# Web dashboard: the source COPY above already carries hermes_cli/web_dist
+# (vite's outDir, which HERMES_WEB_DIST points at) IF it was pre-built into the
+# build context. It can't be built here (Tailwind v4's lightningcss +
+# @tailwindcss/oxide have no riscv64 napi binary, and there is no riscv64 node
+# base image to build them under). The output is arch-independent, so build it
+# once on amd64 (`cd web && npm run build`) and drop hermes_cli/web_dist into
+# the context before building; CI does this with an amd64 artifact. Without it,
+# the dir is simply absent and the image is dashboard-less (the dashboard
+# service is gated off by default via HERMES_DASHBOARD).
 
 # Terminal UI assets build natively: ui-tui uses esbuild, which has first-class
 # riscv64 support (verified building cleanly on the K1).
