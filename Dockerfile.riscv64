@@ -53,6 +53,10 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 #   make g++            : node-gyp compiles native npm addons from source
 #                         (no riscv64 prebuilds) and needs a full C/C++ chain.
 #   pkg-config libssl-dev: cryptography's Rust build links system OpenSSL.
+#   libolm-dev          : Matrix E2EE (python-olm via mautrix[encryption]) is a
+#                         runtime lazy-install with no riscv64 wheel, so it
+#                         compiles from sdist and needs the olm headers (parity
+#                         with the production Dockerfile).
 # Rust itself comes from rustup (installed below), NOT Debian: trixie ships
 # rustc 1.85.0, which is too old for `davey` (Discord DAVE voice E2EE via the
 # openmls crate) — openmls uses `unsigned_is_multiple_of`, stabilized in Rust
@@ -61,7 +65,7 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg \
-    gcc g++ make python3-dev python3-venv libffi-dev procps git openssh-client \
+    gcc g++ make python3-dev python3-venv libffi-dev libolm-dev procps git openssh-client \
     docker-cli xz-utils pkg-config libssl-dev && \
     rm -rf /var/lib/apt/lists/*
 
@@ -132,15 +136,22 @@ RUN set -eu; \
 # ---------- Rust toolchain (riscv64, rustup) ----------
 # riscv64: Debian's rustc 1.85.0 can't build `davey`/openmls (needs the 1.87
 # `unsigned_is_multiple_of`). rustup publishes a first-class riscv64gc host
-# toolchain (verified: installs stable 1.96.0), so use it for every sdist that
-# compiles Rust during `uv sync`. Installed system-wide under /usr/local so
-# both the root build and the hermes user can reach cargo.
+# toolchain, so use it for every sdist that compiles Rust during `uv sync`.
+# Installed system-wide under /usr/local so both the root build and the hermes
+# user can reach cargo. The toolchain is pinned (RUST_VERSION) for reproducible
+# builds — this is the version validated on hardware; it must stay >= 1.87 for
+# openmls. The installer is downloaded to disk and then run (not piped into a
+# shell) so a truncated download can't be masked by sh's lack of pipefail,
+# matching the uv/node/s6 fetches above.
 ENV RUSTUP_HOME=/usr/local/rustup
 ENV CARGO_HOME=/usr/local/cargo
 ENV PATH=/usr/local/cargo/bin:${PATH}
-RUN curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | \
-    sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path && \
-    chmod -R a+rX "${RUSTUP_HOME}" "${CARGO_HOME}" && \
+ARG RUST_VERSION=1.96.0
+RUN set -eu; \
+    curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o /tmp/rustup-init.sh https://sh.rustup.rs; \
+    sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain "${RUST_VERSION}" --no-modify-path; \
+    rm /tmp/rustup-init.sh; \
+    chmod -R a+rX "${RUSTUP_HOME}" "${CARGO_HOME}"; \
     rustc --version && cargo --version
 
 WORKDIR /opt/hermes
