@@ -183,9 +183,12 @@ RUN npm install --prefer-offline --no-audit && \
 # logged as RISC-V source-build candidates for the rise-sponsorship tracker.
 COPY pyproject.toml uv.lock ./
 # pyproject.toml's `readme =` field points at README.md, which .dockerignore's
-# `*.md` rule excludes from the build context. uv stats that path during dep
-# resolution, so stand in an empty placeholder (same workaround as the main
-# Dockerfile); the real README returns with `COPY . .` below.
+# `*.md` rule excludes from the build context. The `uv sync` step below stats
+# that path while resolving deps, so stand in an empty placeholder. Safe: it is
+# overwritten by the real README in `COPY . .` further down, before the file is
+# ever read. Permanent by design (mirrors the main Dockerfile's identical
+# `touch`); not a temporary workaround, since the `*.md` exclusion is
+# intentional, so no removal TODO.
 RUN touch ./README.md
 RUN uv sync --frozen --no-install-project \
     --extra cron --extra cli --extra pty --extra mcp --extra homeassistant \
