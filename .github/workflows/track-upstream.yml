@@ -24,8 +24,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Install updatecli
-        # Not SHA-pinned: the repo has no existing pin for this action to match.
-        uses: updatecli/updatecli-action@v2
+        uses: updatecli/updatecli-action@4b17f4ea784de29f71f85f9bc4955402ba1ae53c # v2.100.0
       - name: Apply
         # Use a dedicated PAT, NOT the default GITHUB_TOKEN: PRs opened with
         # GITHUB_TOKEN do not trigger other workflows, so the release-riscv64
