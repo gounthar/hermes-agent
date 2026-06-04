@@ -172,7 +172,15 @@ ENV npm_config_install_links=false
 # PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD guards any transitive postinstall that
 # would otherwise try to pull a browser.
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
-RUN npm install --prefer-offline --no-audit && \
+# riscv64: use `npm ci`, not `npm install`. The bundled npm (10.9.8 in the
+# unofficial riscv64 Node) crashes during `npm install` reconciliation on a
+# platform that has no matching optional dependency in the lockfile
+# ("Cannot read properties of undefined (reading 'os')"). `npm ci` installs
+# straight from package-lock.json and skips that reconciliation, so it builds
+# cleanly on riscv64. amd64/arm64 don't hit this because their platform IS in
+# the lockfile's optional deps, which is why the production Dockerfile can use
+# `npm install`.
+RUN npm ci --no-audit && \
     npm cache clean --force
 
 # ---------- Layer-cached Python dependency install ----------
