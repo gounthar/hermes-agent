@@ -1,0 +1,48 @@
+---
+name: Validate multi-arch Dockerfile
+
+# Build-only validation of the unified Dockerfile on native amd64 + arm64
+# runners (no push). riscv64 is validated separately on hardware. This exists
+# to prove the TARGETARCH merge doesn't break the existing arches; it can be
+# deleted once the change is upstreamed.
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [feat/multiarch-riscv64-upstream]
+    paths:
+      - Dockerfile
+      - .github/workflows/validate-multiarch-dockerfile.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build (load, no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: hermes:multiarch-validate
+          build-args: |
+            HERMES_GIT_SHA=${{ github.sha }}
+      - name: Smoke test
+        run: docker run --rm hermes:multiarch-validate --version
