@@ -22,8 +22,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Install updatecli
+        # Not SHA-pinned: the repo has no existing pin for this action to match.
         uses: updatecli/updatecli-action@v2
       - name: Apply
         # Use a dedicated PAT, NOT the default GITHUB_TOKEN: PRs opened with

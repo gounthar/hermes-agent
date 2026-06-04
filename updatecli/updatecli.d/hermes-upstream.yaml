@@ -45,9 +45,11 @@ actions:
     kind: github/pullrequest
     scmid: default
     spec:
+      # mergemethod (how: squash/merge/rebase) is a TOP-LEVEL field; the merge
+      # sub-struct only has strategy (when: auto/client/manual) and after.
+      mergemethod: squash
       merge:
         strategy: auto
-        method: squash
       title: 'chore: sync upstream Hermes {{ source "upstreamRelease" }}'
       labels:
         - riscv64
