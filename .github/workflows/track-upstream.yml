@@ -26,10 +26,10 @@ jobs:
       - name: Install updatecli
         uses: updatecli/updatecli-action@4b17f4ea784de29f71f85f9bc4955402ba1ae53c # v2.100.0
       - name: Apply
-        # Use a dedicated PAT, NOT the default GITHUB_TOKEN: PRs opened with
-        # GITHUB_TOKEN do not trigger other workflows, so the release-riscv64
-        # build would never fire on merge. Set UPDATECLI_GITHUB_TOKEN as a repo
-        # secret (a fine-grained PAT with contents + pull-requests write).
+        # Prefer the dedicated PAT (UPDATECLI_GITHUB_TOKEN) so that PRs opened
+        # by updatecli can trigger other workflows (PRs from GITHUB_TOKEN cannot).
+        # Falls back to GITHUB_TOKEN so the job doesn't fail when the secret is
+        # absent (e.g. forks, or before the secret is configured).
         env:
-          UPDATECLI_GITHUB_TOKEN: ${{ secrets.UPDATECLI_GITHUB_TOKEN }}
+          UPDATECLI_GITHUB_TOKEN: ${{ secrets.UPDATECLI_GITHUB_TOKEN || github.token }}
         run: updatecli pipeline apply --config updatecli/updatecli.d/
