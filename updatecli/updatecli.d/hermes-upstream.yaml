@@ -16,7 +16,7 @@ scms:
       owner: gounthar
       repository: hermes-agent
       token: '{{ requiredEnv "UPDATECLI_GITHUB_TOKEN" }}'
-      username: gounthar
+      username: x-access-token
       branch: main
 
 sources:
