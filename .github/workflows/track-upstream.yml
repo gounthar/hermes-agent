@@ -5,7 +5,8 @@ name: Track upstream releases
 # releases. On a new release it opens a PR bumping .upstream-version that
 # auto-merges (squash); the merge pushes .upstream-version to main, which
 # triggers release-riscv64.yml to build and publish the riscv64 image.
-# Needs UPDATECLI_GITHUB_TOKEN (a PAT) + "Allow auto-merge" on the repo.
+# Uses github.token (contents: write + pull-requests: write already declared).
+# "Allow auto-merge" must be enabled in repo Settings → General.
 
 on:
   schedule:
@@ -26,10 +27,12 @@ jobs:
       - name: Install updatecli
         uses: updatecli/updatecli-action@4b17f4ea784de29f71f85f9bc4955402ba1ae53c # v2.100.0
       - name: Apply
-        # Prefer the dedicated PAT (UPDATECLI_GITHUB_TOKEN) so that PRs opened
-        # by updatecli can trigger other workflows (PRs from GITHUB_TOKEN cannot).
-        # Falls back to GITHUB_TOKEN so the job doesn't fail when the secret is
-        # absent (e.g. forks, or before the secret is configured).
+        # Use github.token; the workflow already has contents: write and
+        # pull-requests: write permissions, which is sufficient for updatecli
+        # to open and auto-merge PRs within this repository.
+        # If you need PRs opened by updatecli to trigger other workflows,
+        # set a valid UPDATECLI_GITHUB_TOKEN PAT secret and change this line to:
+        #   UPDATECLI_GITHUB_TOKEN: ${{ secrets.UPDATECLI_GITHUB_TOKEN || github.token }}
         env:
-          UPDATECLI_GITHUB_TOKEN: ${{ secrets.UPDATECLI_GITHUB_TOKEN || github.token }}
+          UPDATECLI_GITHUB_TOKEN: ${{ github.token }}
         run: updatecli pipeline apply --config updatecli/updatecli.d/
