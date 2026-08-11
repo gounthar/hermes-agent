@@ -172,15 +172,41 @@ ENV npm_config_install_links=false
 # PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD guards any transitive postinstall that
 # would otherwise try to pull a browser.
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
-# riscv64: use `npm ci`, not `npm install`. The bundled npm (10.9.8 in the
-# unofficial riscv64 Node) crashes during `npm install` reconciliation on a
-# platform that has no matching optional dependency in the lockfile
-# ("Cannot read properties of undefined (reading 'os')"). `npm ci` installs
-# straight from package-lock.json and skips that reconciliation, so it builds
-# cleanly on riscv64. amd64/arm64 don't hit this because their platform IS in
-# the lockfile's optional deps, which is why the production Dockerfile can use
-# `npm install`.
-RUN npm ci --no-audit && \
+# riscv64: use `npm ci`, not `npm install`, and run it under `--predictable`.
+#
+# Two riscv64-only npm failures have been seen here, and both look like the
+# same root cause: V8's parallel scavenger corrupting the heap on the
+# unofficial riscv64 Node build. The symptom each time is type confusion,
+# where an object of the wrong shape turns up somewhere the code proved it
+# could not:
+#
+#   npm install: "Cannot read properties of undefined (reading 'os')"
+#   npm ci:      "set.delete is not a function"
+#
+# The second one is the clearest evidence. `set.delete` is called in exactly
+# two places in npm 10.9.8 (@npmcli/arborist inventory.js:109 and
+# rebuild.js:253); both operate on a Set built by the caller, and the
+# inventory.js one is already guarded by `if (set)`. There is no input that
+# makes a real Set lack `.delete`, and JavaScript's single-threaded async
+# concurrency cannot corrupt an object's shape either.
+#
+# It is also not reproducible off riscv64: the same lockfile and the same npm
+# 10.9.8 install cleanly on amd64. And it is intermittent. Two builds 20
+# minutes apart on an identical lockfile died 8.6s and 95.3s into the same
+# `npm ci`, and an earlier build of that same lockfile succeeded outright.
+#
+# `--predictable` disables parallel GC, which is the workaround already known
+# to fix V8 heap corruption on riscv64 (`vite build` hits it too). It costs
+# build time on this layer. It has to be passed to node directly because node
+# rejects it in NODE_OPTIONS ("--predictable is not allowed in NODE_OPTIONS"),
+# hence invoking npm-cli.js rather than the `npm` shim.
+#
+# `npm ci` is kept over `npm install` because it installs straight from
+# package-lock.json and does far less work than `npm install` reconciliation,
+# which narrows the window regardless of whether the GC theory holds.
+# amd64/arm64 need none of this, which is why the production Dockerfile can
+# use a plain `npm install`.
+RUN node --predictable /usr/local/lib/node_modules/npm/bin/npm-cli.js ci --no-audit && \
     npm cache clean --force
 
 # ---------- Layer-cached Python dependency install ----------
