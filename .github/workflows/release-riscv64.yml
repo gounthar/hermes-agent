@@ -49,11 +49,15 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: "22"
+          # package.json requires node >=26 and .npmrc sets engine-strict.
+          # Same version as upstream's pm/lock.json.
+          node-version: "26.12.1"
       - name: Build dashboard (vite outDir -> hermes_cli/web_dist)
+        # Upstream's own dependency and product scripts; the icons web.mjs
+        # reads in its no-argument mode are committed under web/public.
         run: |
-          npm ci
-          npm run build --workspace web
+          node scripts/build/node-deps.mjs --source "$GITHUB_WORKSPACE" --workspace web
+          node scripts/build/web.mjs
       - name: Upload web_dist
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -68,8 +72,9 @@ jobs:
     # RISE's free, managed, native riscv64 runner. Requires the repo to be
     # enrolled in the RISE runner program (the RISE GitHub App installed on
     # this repo, see riseproject.dev); otherwise this label won't resolve.
-    # Native riscv64 is required: the from-source Rust compiles are ~40 min
-    # native vs hours under QEMU.
+    # Native riscv64 is required: about 15 dependencies build from sdist
+    # (Rust and C++). v0.23.0 took 3 h 26 min on a Banana Pi F3 (SpaceMiT
+    # K1); under QEMU it would be many times that.
     runs-on: ubuntu-24.04-riscv
     steps:
       - name: Checkout
@@ -97,6 +102,18 @@ jobs:
             exit 1
           fi
           echo "version=$v" >> "$GITHUB_OUTPUT"
+      - name: Write install stamp
+        # Same stamp upstream's docker.yml writes before its build. Without
+        # it the Dockerfile falls back to a placeholder and `hermes --version`
+        # reports "vunknown". The RISE runner has no python3 on PATH.
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          py="$(command -v python3 || echo /opt/python-3.12/bin/python3.12)"
+          "$py" scripts/write_install_stamp.py --output install-stamp.json \
+            --distribution docker --update-mechanism external --source ci \
+            --commit "${GITHUB_SHA}" --base-version "${VERSION}" \
+            --display-version "${VERSION}" --distance 0
       - name: Download web dashboard
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:

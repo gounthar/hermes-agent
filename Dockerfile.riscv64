@@ -36,6 +36,18 @@
 #      service is gated off by default). See the web_dist note before the
 #      source COPY below.
 #
+#   6. Python 3.14 comes from python-build-standalone's riscv64 build, pinned
+#      to the same release upstream's pm/lock.json uses. Upstream supports
+#      3.14 only (every dependency is gated on python_version >= '3.14') and
+#      Debian trixie ships 3.13.
+#   7. Upstream's `pm` provisioner (uv, node, Chromium, ffmpeg, ripgrep, the
+#      pm-runtime and the `docker.build_agent` assembly step) is skipped:
+#      pm.store.current_target() raises on any arch other than x64/arm64.
+#      The project is linked with an editable install instead, as before, and
+#      opt-in extras that upstream installs lazily at first use through pm
+#      are unavailable; only the extras baked in at build time work.
+#   8. The desktop Webapp bundle (apps/desktop/dist-webapp) is not built.
+#
 # Debian trixie is an official RISC-V port, so the runtime base is unchanged.
 
 FROM debian:13.4
@@ -53,6 +65,9 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 #   make g++            : node-gyp compiles native npm addons from source
 #                         (no riscv64 prebuilds) and needs a full C/C++ chain.
 #   pkg-config libssl-dev: cryptography's Rust build links system OpenSSL.
+#   libjpeg62-turbo-dev zlib1g-dev libheif-dev:
+#                         Pillow and pillow-heif have no riscv64 wheel and
+#                         build from sdist against these headers.
 #   libolm-dev          : Matrix E2EE (python-olm via mautrix[encryption]) is a
 #                         runtime lazy-install with no riscv64 wheel, so it
 #                         compiles from sdist and needs the olm headers (parity
@@ -64,9 +79,10 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 # cryptography, watchfiles, etc. all run against the rustup toolchain.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg \
-    gcc g++ make python3-dev python3-venv libffi-dev libolm-dev procps git openssh-client \
-    docker-cli xz-utils pkg-config libssl-dev && \
+    ca-certificates curl iputils-ping ripgrep ffmpeg \
+    gcc g++ make libffi-dev libolm-dev procps git openssh-client \
+    docker-cli xz-utils pkg-config libssl-dev \
+    libjpeg62-turbo-dev zlib1g-dev libheif-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # ---------- s6-overlay install ----------
@@ -101,8 +117,9 @@ RUN useradd -u 10000 -m -d /opt/data hermes
 # riscv64: production copies uv from ghcr.io/astral-sh/uv (no riscv64
 # manifest). Astral does publish a standalone riscv64 binary, so fetch and
 # verify it. Tarball layout: uv-riscv64gc-unknown-linux-gnu/{uv,uvx}.
-ARG UV_VERSION=0.11.6
-ARG UV_RISCV64_SHA256=0e3ead8667b51b07b5fb9d114bcd1914a5fe3159e6959a584dc2f89c6724e123
+# Same uv version as upstream's pm/lock.json.
+ARG UV_VERSION=0.13.5
+ARG UV_RISCV64_SHA256=5c2692ecbf3a9d2c5955c403b30e61740b3ea2fdcc9b6eb533eeda268bf2b56d
 RUN set -eu; \
     curl -fsSL --retry 3 -o /tmp/uv.tar.gz \
         "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-riscv64gc-unknown-linux-gnu.tar.gz"; \
@@ -113,19 +130,48 @@ RUN set -eu; \
     rm /tmp/uv.tar.gz; \
     uv --version
 
-# ---------- Node 22 (riscv64, unofficial-builds) ----------
-# riscv64: nodejs.org/dist ships NO riscv64 binary. The Node project's
-# `unofficial-builds` sub-project cross-compiles riscv64 on Ubuntu 24.04
-# (glibc 2.39) — that runs cleanly on trixie (glibc 2.41). This pins a
-# specific patch (22.22.3) independent of the bookworm node:22 tag the
-# production image tracks. Extracting the whole prefix gives a complete,
-# correctly-symlinked node/npm/npx/corepack install (and node headers for
-# node-gyp), so the production COPY+symlink dance is unnecessary here.
-ARG NODE_VERSION=22.22.3
-ARG NODE_RISCV64_SHA256=7a2c78e87eb154d450c5cccc6f9a8b3de1a0854ee78f3ef92a2d7e4c71d4985f
+# ---------- Python 3.14 (riscv64, python-build-standalone) ----------
+# riscv64: upstream gets this interpreter through pm, which has no riscv64
+# target (divergence #7). python-build-standalone publishes the same release
+# for riscv64; the non-stripped install_only tarball keeps the headers that
+# the sdist builds below need. Symlinked to /usr/local/bin/python3 like
+# upstream's image.
+ARG PYTHON_RELEASE=3.14.9+20261021
+ARG PYTHON_RISCV64_SHA256=b374284692dd4ef0cbfde99c434548fffea4c3e4fd9683b430d23ad0ecda64db
+RUN set -eu; \
+    tag="${PYTHON_RELEASE#*+}"; \
+    curl -fsSL --retry 3 -o /tmp/python.tar.gz \
+        "https://github.com/astral-sh/python-build-standalone/releases/download/${tag}/cpython-$(printf '%s' "${PYTHON_RELEASE}" | sed 's/+/%2B/')-riscv64-unknown-linux-gnu-install_only.tar.gz"; \
+    printf '%s  %s\n' "${PYTHON_RISCV64_SHA256}" /tmp/python.tar.gz | sha256sum -c; \
+    mkdir -p /opt/python; \
+    tar -C /opt/python --strip-components=1 -xzf /tmp/python.tar.gz; \
+    rm /tmp/python.tar.gz; \
+    ln -s /opt/python/bin/python3 /usr/local/bin/python3; \
+    ln -s /opt/python/bin/python3 /usr/local/bin/python; \
+    python3 --version
+# The standalone interpreter records its builder's clang toolchain (CC=clang,
+# LDSHARED="clang -shared", AR=/tools/llvm/bin/llvm-ar); native extensions
+# such as Pillow and PyNaCl must use the toolchain installed in this image.
+ENV CC=gcc CXX=g++ AR=ar \
+    LDSHARED="gcc -pthread -shared" LDCXXSHARED="g++ -pthread -shared"
+
+# ---------- Node 26 (riscv64) ----------
+# riscv64: nodejs.org/dist ships NO riscv64 binary. package.json requires
+# node >=26 and npm <11.10.0 || >=11.17.0, and .npmrc sets engine-strict.
+# The only Node 26 on unofficial-builds.nodejs.org for riscv64 is v26.0.0,
+# whose npm 11.12.1 falls in the excluded range, so this takes v26.13.0
+# (npm 11.20.0) from the gounthar/unofficial-builds fork. It must be the
+# v26.13.0-lmulfix release: npm in the plain v26.13.0 (and in unofficial
+# v26.0.0) dies with SIGILL on a SpaceMiT K1 (RVV, VLEN 256; nodejs/node#64538).
+# That release adds the V8 LMUL fixes. Upstream pins 26.12.1.
+# Extracting the whole prefix gives a complete, correctly-symlinked
+# node/npm/npx/corepack install (and node headers for node-gyp).
+ARG NODE_VERSION=26.13.0
+ARG NODE_RELEASE_TAG=v26.13.0-lmulfix
+ARG NODE_RISCV64_SHA256=0ffcf2ed6cf889b95ccc15c586cdc397bd9c26f9a9fd51980f27ad75b72407ec
 RUN set -eu; \
     curl -fsSL --retry 3 -o /tmp/node.tar.xz \
-        "https://unofficial-builds.nodejs.org/download/release/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-riscv64.tar.xz"; \
+        "https://github.com/gounthar/unofficial-builds/releases/download/${NODE_RELEASE_TAG}/node-v${NODE_VERSION}-linux-riscv64.tar.xz"; \
     printf '%s  %s\n' "${NODE_RISCV64_SHA256}" /tmp/node.tar.xz | sha256sum -c; \
     tar -C /usr/local --strip-components=1 \
         --exclude='*/CHANGELOG.md' --exclude='*/LICENSE' --exclude='*/README.md' \
@@ -162,6 +208,7 @@ COPY package.json package-lock.json ./
 COPY web/package.json web/
 COPY ui-tui/package.json ui-tui/
 COPY ui-tui/packages/hermes-ink/ ui-tui/packages/hermes-ink/
+COPY apps/shared/ apps/shared/
 
 ENV npm_config_install_links=false
 
@@ -199,33 +246,36 @@ ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 # to fix V8 heap corruption on riscv64 (`vite build` hits it too). It costs
 # build time on this layer. It has to be passed to node directly because node
 # rejects it in NODE_OPTIONS ("--predictable is not allowed in NODE_OPTIONS"),
-# hence invoking npm-cli.js rather than the `npm` shim.
+# hence invoking npm-cli.js rather than the `npm` shim. Upstream wraps this
+# step in scripts/build/node-deps.mjs, which starts npm as a child process
+# without the flag, so the same `npm ci` arguments it builds are passed here
+# directly (ui-tui and web workspaces plus the root).
 #
 # `npm ci` is kept over `npm install` because it installs straight from
 # package-lock.json and does far less work than `npm install` reconciliation,
 # which narrows the window regardless of whether the GC theory holds.
 # amd64/arm64 need none of this, which is why the production Dockerfile can
 # use a plain `npm install`.
-RUN node --predictable /usr/local/lib/node_modules/npm/bin/npm-cli.js ci --no-audit && \
+RUN node --predictable /usr/local/lib/node_modules/npm/bin/npm-cli.js ci \
+        --no-audit --no-fund --engine-strict --include=dev --include=optional \
+        --include-workspace-root=true --workspace ui-tui --workspace web && \
     npm cache clean --force
 
 # ---------- Layer-cached Python dependency install ----------
 # riscv64: this is THE expensive, failure-prone layer. With no manylinux
 # riscv64 wheels available, `uv sync --frozen` builds every native extension
 # from sdist using the Rust + C toolchains installed above. Expect long
-# compiles (tokenizers / pydantic-core / cryptography are the heavy ones) and
-# watch here first when the build fails — a missing sdist or an unbuildable
-# crate surfaces at this step.
+# compiles and watch here first when the build fails — a missing sdist or an
+# unbuildable crate surfaces at this step. As of v0.23.0 about 15 packages have
+# no cp314 riscv64 wheel in uv.lock; the heavy ones are grpcio (C++),
+# cryptography, resvg-py and firecrawl-anydoc (Rust), plus Pillow and
+# pillow-heif.
 #
-# riscv64 divergence: the production image uses `--extra all`, which composes
-# in `[dev]` (ty + ruff + pytest). `ty==0.0.21` is a maturin/Rust build of
-# the ruff workspace that requires rustc > 1.85; Debian trixie ships exactly
-# 1.85.0, so it fails to build (`rustc 1.85.0 is not supported`). ty/ruff are
-# dev/CI type-checking tools with no runtime role, so we enumerate `[all]`
-# MINUS `[dev]` here instead of pulling a newer Rust just to compile two dev
-# tools. To restore parity, install a newer toolchain (rustup stable) before
-# this step and append `--extra dev`. The omitted dev tools (ty, ruff) are
-# logged as RISC-V source-build candidates for the rise-sponsorship tracker.
+# The extras are the same list as upstream's python_deps stage. Upstream runs
+# them through `python3 -m pm.build_env --sealed`; pm has no riscv64 target
+# (divergence #7), so this is the plain `uv sync --frozen` equivalent against
+# the interpreter installed above. `[dev]` is a dependency group, not part of
+# `[all]`, and --no-dev keeps it out as upstream does.
 COPY pyproject.toml uv.lock ./
 # pyproject.toml's `readme =` field points at README.md, which .dockerignore's
 # `*.md` rule excludes from the build context. The `uv sync` step below stats
@@ -235,11 +285,10 @@ COPY pyproject.toml uv.lock ./
 # `touch`); not a temporary workaround, since the `*.md` exclusion is
 # intentional, so no removal TODO.
 RUN touch ./README.md
-RUN uv sync --frozen --no-install-project \
-    --extra cron --extra cli --extra pty --extra mcp --extra homeassistant \
-    --extra sms --extra acp --extra google --extra web --extra youtube \
-    --extra messaging --extra anthropic --extra bedrock --extra azure-identity \
-    --extra hindsight
+RUN UV_PYTHON_DOWNLOADS=never uv sync --frozen --no-install-project --no-dev \
+    --python /usr/local/bin/python3 \
+    --extra all --extra messaging --extra otlp --extra anthropic --extra bedrock \
+    --extra azure-identity --extra matrix --extra google-chat --extra fal --extra documents
 
 # ---------- Source code ----------
 COPY --chown=hermes:hermes . .
@@ -249,14 +298,23 @@ COPY --chown=hermes:hermes . .
 # build context. It can't be built here (Tailwind v4's lightningcss +
 # @tailwindcss/oxide have no riscv64 napi binary, and there is no riscv64 node
 # base image to build them under). The output is arch-independent, so build it
-# once on amd64 (`cd web && npm run build`) and drop hermes_cli/web_dist into
+# once on amd64 (`npm run build --workspace web`) and drop hermes_cli/web_dist into
 # the context before building; CI does this with an amd64 artifact. Without it,
 # the dir is simply absent and the image is dashboard-less (the dashboard
 # service is gated off by default via HERMES_DASHBOARD).
 
 # Terminal UI assets build natively: ui-tui uses esbuild, which has first-class
-# riscv64 support (verified building cleanly on the K1).
-RUN cd /opt/hermes/ui-tui && npm run build && echo "RISCV64_TUI_BUILD=ok"
+# riscv64 support. Same product build as upstream's frontend_build stage, run
+# under --predictable for the V8 reason given at the npm ci step, then laid
+# over the source tree where upstream's runtime stage puts it.
+RUN node --predictable scripts/build/tui.mjs --source /opt/hermes --out /tmp/products/tui && \
+    cp -a /tmp/products/tui/. /opt/hermes/ui-tui/ && \
+    rm -rf /tmp/products && echo "RISCV64_TUI_BUILD=ok"
+
+# Optional Photon platform sidecar, installed the same way as upstream.
+RUN cd plugins/platforms/photon/sidecar && \
+    node --predictable /usr/local/lib/node_modules/npm/bin/npm-cli.js ci --no-audit --fetch-retries=5 && \
+    npm cache clean --force
 
 # ---------- Permissions ----------
 USER root
@@ -264,7 +322,25 @@ RUN chmod -R a+rX /opt/hermes && \
     chown -R hermes:hermes /opt/hermes/.venv /opt/hermes/ui-tui /opt/hermes/gateway /opt/hermes/node_modules
 
 # ---------- Link hermes-agent itself (editable) ----------
-RUN uv pip install --no-cache-dir --no-deps -e "."
+# riscv64: replaces upstream's `python -m docker.build_agent` (divergence #7),
+# which needs pm. The [project.scripts] entry points (hermes, hermes-agent,
+# hermes-acp) land in .venv/bin, where hermes-exec-shim.sh looks for them.
+RUN uv pip install --no-cache-dir --no-deps --python /opt/hermes/.venv/bin/python -e "." && \
+    test -x /opt/hermes/.venv/bin/hermes
+
+# ---------- Install method, stamp and image provenance ----------
+# Same files as upstream's runtime stage, minus the pmRuntime key (no pm
+# runtime in this image) and with this image's own name.
+RUN set -eu; \
+    printf 'docker\n' > /opt/hermes/.install_method; \
+    if [ ! -f /opt/hermes/install-stamp.json ]; then \
+        printf '{"schemaVersion":2,"commit":"0000000000000000000000000000000000000000","distribution":"docker","source":"fallback","updateMechanism":"external"}\n' \
+            > /opt/hermes/install-stamp.json; \
+    fi; \
+    mkdir -p /etc/hermes; \
+    python3 -c 'import json, pathlib, tomllib; project = tomllib.loads(pathlib.Path("/opt/hermes/pyproject.toml").read_text(encoding="utf-8"))["project"]; stamp = json.loads(pathlib.Path("/opt/hermes/install-stamp.json").read_text(encoding="utf-8")); commit = stamp.get("commit"); revision = commit if commit and set(commit) != {"0"} else None; marker = pathlib.Path("/etc/hermes/image-provenance.json"); marker.write_text(json.dumps({"schema": 1, "deployment_kind": "image", "manager": "docker", "image": "gounthar/hermes-agent", "version": project["version"], "revision": revision}, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"); marker.chmod(0o444)'; \
+    mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix; \
+    mkdir -p /tmp/hermes-runtime && chmod 0700 /tmp/hermes-runtime
 
 # ---------- Bake build-time git revision ----------
 ARG HERMES_GIT_SHA=
@@ -287,12 +363,19 @@ COPY --chmod=0755 docker/cont-init.d/02-reconcile-profiles /etc/cont-init.d/02-r
 ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
 ENV HERMES_TUI_DIR=/opt/hermes/ui-tui
 ENV HERMES_HOME=/opt/data
+ENV HERMES_WRITE_SAFE_ROOT=/opt/data
+ENV XDG_RUNTIME_DIR=/tmp/hermes-runtime
 
 COPY --chmod=0755 docker/hermes-exec-shim.sh /opt/hermes/bin/hermes
+COPY --chmod=0755 docker/entrypoint-dispatch.sh /opt/hermes/docker/entrypoint-dispatch.sh
 
 ENV PATH="/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:${PATH}"
-RUN mkdir -p /opt/data
+COPY --chmod=0644 docker/profile-hermes-path.sh /etc/profile.d/hermes.sh
+RUN mkdir -p /opt/data && rm -f /opt/hermes/.venv/.lock
+ENV HERMES_PYTHON=/opt/hermes/.venv/bin/python
 VOLUME [ "/opt/data" ]
 
-ENTRYPOINT [ "/init", "/opt/hermes/docker/main-wrapper.sh" ]
+# Same dispatcher as upstream: execs s6-overlay's /init when PID 1, and runs
+# the stage2 bootstrap directly under a foreign init.
+ENTRYPOINT [ "/opt/hermes/docker/entrypoint-dispatch.sh" ]
 CMD [ ]
