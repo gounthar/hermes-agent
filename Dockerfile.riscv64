@@ -259,7 +259,7 @@ ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 RUN node --predictable /usr/local/lib/node_modules/npm/bin/npm-cli.js ci \
         --no-audit --no-fund --engine-strict --include=dev --include=optional \
         --include-workspace-root=true --workspace ui-tui --workspace web && \
-    npm cache clean --force
+    node --predictable /usr/local/lib/node_modules/npm/bin/npm-cli.js cache clean --force
 
 # ---------- Layer-cached Python dependency install ----------
 # riscv64: this is THE expensive, failure-prone layer. With no manylinux
@@ -314,7 +314,7 @@ RUN node --predictable scripts/build/tui.mjs --source /opt/hermes --out /tmp/pro
 # Optional Photon platform sidecar, installed the same way as upstream.
 RUN cd plugins/platforms/photon/sidecar && \
     node --predictable /usr/local/lib/node_modules/npm/bin/npm-cli.js ci --no-audit --fetch-retries=5 && \
-    npm cache clean --force
+    node --predictable /usr/local/lib/node_modules/npm/bin/npm-cli.js cache clean --force
 
 # ---------- Permissions ----------
 USER root
