@@ -46,12 +46,16 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Set up Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - name: Set up Node and pnpm
+        # Upstream's own action: installs the node and pnpm pinned in
+        # pm/lock.json (package.json requires node >=26 and pnpm ^12, and
+        # pnpm-workspace.yaml sets engineStrict). Caches off, as in upstream's
+        # bootstrap-installer-build.yml.
+        uses: ./.github/actions/setup-pm
         with:
-          # package.json requires node >=26 and .npmrc sets engine-strict.
-          # Same version as upstream's pm/lock.json.
-          node-version: "26.12.1"
+          toolchain: node
+          cache: false
+          cache-node: false
       - name: Build dashboard (vite outDir -> hermes_cli/web_dist)
         # Upstream's own dependency and product scripts; the icons web.mjs
         # reads in its no-argument mode are committed under web/public.
