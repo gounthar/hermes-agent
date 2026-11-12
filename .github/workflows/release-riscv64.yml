@@ -38,8 +38,69 @@ env:
   GHCR_IMAGE: ghcr.io/gounthar/hermes-agent
 
 jobs:
+  version:
+    name: Resolve version and check it matches the code
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Resolve and validate version
+        id: ver
+        # Inputs come in via env (never interpolated into the shell) because
+        # client_payload.* is attacker-controllable on repository_dispatch.
+        # The resolved value is then validated against a strict version pattern
+        # before it is ever used in a tag or shell command.
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          DISPATCH_VERSION: ${{ github.event.client_payload.version }}
+        run: |
+          v="${INPUT_VERSION}"
+          [ -z "$v" ] && v="${DISPATCH_VERSION}"
+          [ -z "$v" ] && v="$(cat .upstream-version 2>/dev/null || true)"
+          if [ -z "$v" ]; then
+            echo "::error::No version resolved (input, dispatch payload, and .upstream-version all empty)"
+            exit 1
+          fi
+          v="${v#v}"
+          if ! printf '%s' "$v" | grep -Eq '^[0-9]+\.[0-9]+(\.[0-9]+)?([.-][0-9A-Za-z.]+)?$'; then
+            echo "::error::Refusing unexpected version string"
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - name: Require the upstream tag in this commit's history
+        # .upstream-version is bumped by updatecli on its own, before anyone
+        # merges the upstream code. Publishing then would tag the old code
+        # with the new version (it happened with 0.23.1 on 2026-11-10). So
+        # the upstream tag v<version> must be an ancestor of the commit being
+        # built. The compare API sees the fork network, so the tag's commit
+        # resolves here even though the fork does not carry upstream tags.
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Prefer the peeled commit (^{}) of an annotated tag over the tag object.
+          refs="$(git ls-remote https://github.com/NousResearch/hermes-agent.git "refs/tags/v${VERSION}" "refs/tags/v${VERSION}^{}")"
+          tag_sha="$(printf '%s\n' "$refs" | awk '$2 ~ /\^\{\}$/ {print $1; exit}')"
+          [ -z "$tag_sha" ] && tag_sha="$(printf '%s\n' "$refs" | awk 'NR==1 {print $1}')"
+          if [ -z "$tag_sha" ]; then
+            echo "::error::Upstream has no tag v${VERSION}"
+            exit 1
+          fi
+          status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${tag_sha}...${GITHUB_SHA}" --jq .status)"
+          echo "v${VERSION} is ${tag_sha}; ${GITHUB_SHA} is ${status} of it"
+          case "$status" in
+            ahead|identical) ;;
+            *)
+              echo "::error::v${VERSION} (${tag_sha}) is not in the history of ${GITHUB_SHA}; merge the upstream tag before publishing"
+              exit 1
+              ;;
+          esac
+
   dashboard:
     name: Build web dashboard (amd64)
+    needs: version
     runs-on: ubuntu-latest
     env:
       PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
@@ -72,7 +133,7 @@ jobs:
 
   image:
     name: Build and push riscv64 image
-    needs: dashboard
+    needs: [version, dashboard]
     # RISE's free, managed, native riscv64 runner. Requires the repo to be
     # enrolled in the RISE runner program (the RISE GitHub App installed on
     # this repo, see riseproject.dev); otherwise this label won't resolve.
@@ -83,35 +144,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Resolve and validate version
-        id: ver
-        # Inputs come in via env (never interpolated into the shell) because
-        # client_payload.* is attacker-controllable on repository_dispatch.
-        # The resolved value is then validated against a strict version pattern
-        # before it is ever used in a tag or shell command.
-        env:
-          INPUT_VERSION: ${{ github.event.inputs.version }}
-          DISPATCH_VERSION: ${{ github.event.client_payload.version }}
-        run: |
-          v="${INPUT_VERSION}"
-          [ -z "$v" ] && v="${DISPATCH_VERSION}"
-          [ -z "$v" ] && v="$(cat .upstream-version 2>/dev/null || true)"
-          if [ -z "$v" ]; then
-            echo "::error::No version resolved (input, dispatch payload, and .upstream-version all empty)"
-            exit 1
-          fi
-          v="${v#v}"
-          if ! printf '%s' "$v" | grep -Eq '^[0-9]+\.[0-9]+(\.[0-9]+)?([.-][0-9A-Za-z.]+)?$'; then
-            echo "::error::Refusing unexpected version string"
-            exit 1
-          fi
-          echo "version=$v" >> "$GITHUB_OUTPUT"
       - name: Write install stamp
         # Same stamp upstream's docker.yml writes before its build. Without
         # it the Dockerfile falls back to a placeholder and `hermes --version`
         # reports "vunknown". The RISE runner has no python3 on PATH.
         env:
-          VERSION: ${{ steps.ver.outputs.version }}
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           py="$(command -v python3 || echo /opt/python-3.12/bin/python3.12)"
           "$py" scripts/write_install_stamp.py --output install-stamp.json \
@@ -136,7 +174,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build image
         env:
-          VERSION: ${{ steps.ver.outputs.version }}
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           docker build -f Dockerfile.riscv64 \
             --build-arg HERMES_GIT_SHA="${GITHUB_SHA}" \
@@ -149,7 +187,7 @@ jobs:
         run: docker run --rm "${GHCR_IMAGE}:riscv64" --version
       - name: Push images
         env:
-          VERSION: ${{ steps.ver.outputs.version }}
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           docker push "${DOCKERHUB_IMAGE}:${VERSION}-riscv64"
           docker push "${DOCKERHUB_IMAGE}:riscv64"
@@ -157,7 +195,7 @@ jobs:
           docker push "${GHCR_IMAGE}:riscv64"
       - name: Summary
         env:
-          VERSION: ${{ steps.ver.outputs.version }}
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           {
             echo "### riscv64 image published";
