@@ -47,6 +47,7 @@
 #      opt-in extras that upstream installs lazily at first use through pm
 #      are unavailable; only the extras baked in at build time work.
 #   8. The desktop Webapp bundle (apps/desktop/dist-webapp) is not built.
+#   9. pnpm comes from its native riscv64 npm package instead of pm (see #7).
 #
 # Debian trixie is an official RISC-V port, so the runtime base is unchanged.
 
@@ -203,63 +204,46 @@ RUN set -eu; \
 WORKDIR /opt/hermes
 
 # ---------- Layer-cached dependency install ----------
+# riscv64: upstream installs pnpm through pm (divergence #7). pm has no riscv64
+# target, so the same pnpm version (pm/lock.json packages.pnpm) is taken from
+# its native riscv64 package on npm, checksum-pinned. pnpm 12 ships only native
+# executables (Node single-executable builds); the `pnpm` npm package is a
+# launcher that downloads one, so there is no pure-JS pnpm to run instead.
+ARG PNPM_VERSION=12.15.0
+ARG PNPM_RISCV64_SHA256=c102a77f144c437abd662f4267f2e2fef30a953db9ea9b7deb9dc873adc74f8f
+RUN set -eu; \
+    curl -fsSL --retry 3 -o /tmp/pnpm.tgz \
+        "https://registry.npmjs.org/@pnpm/exe.linux-riscv64/-/exe.linux-riscv64-${PNPM_VERSION}.tgz"; \
+    printf '%s  %s\n' "${PNPM_RISCV64_SHA256}" /tmp/pnpm.tgz | sha256sum -c; \
+    tar -xzf /tmp/pnpm.tgz -C /tmp; \
+    install -m 0755 /tmp/package/pnpm /usr/local/bin/pnpm; \
+    rm -rf /tmp/pnpm.tgz /tmp/package; \
+    pnpm --version
+
 # See production Dockerfile for the workspace-copy rationale; identical here.
-COPY package.json package-lock.json ./
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
 COPY web/package.json web/
 COPY ui-tui/package.json ui-tui/
 COPY ui-tui/packages/hermes-ink/ ui-tui/packages/hermes-ink/
 COPY apps/shared/ apps/shared/
-
-ENV npm_config_install_links=false
+COPY pm/lock.json pm/
+COPY scripts/build/node-deps*.mjs scripts/build/electron-runtime.mjs scripts/build/pnpm-lock.mjs scripts/build/
 
 # riscv64: Playwright Chromium has no riscv64 build, so the production
 # `npx playwright install --with-deps chromium` step is omitted — it would
-# hard-fail. npm install still runs so the TUI and dashboard build inputs
-# are present. Browser-automation features are disabled in this image.
+# hard-fail. The workspace install still runs so the TUI and dashboard build
+# inputs are present. Browser-automation features are disabled in this image.
 # PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD guards any transitive postinstall that
 # would otherwise try to pull a browser.
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
-# riscv64: use `npm ci`, not `npm install`, and run it under `--predictable`.
-#
-# Two riscv64-only npm failures have been seen here, and both look like the
-# same root cause: V8's parallel scavenger corrupting the heap on the
-# unofficial riscv64 Node build. The symptom each time is type confusion,
-# where an object of the wrong shape turns up somewhere the code proved it
-# could not:
-#
-#   npm install: "Cannot read properties of undefined (reading 'os')"
-#   npm ci:      "set.delete is not a function"
-#
-# The second one is the clearest evidence. `set.delete` is called in exactly
-# two places in npm 10.9.8 (@npmcli/arborist inventory.js:109 and
-# rebuild.js:253); both operate on a Set built by the caller, and the
-# inventory.js one is already guarded by `if (set)`. There is no input that
-# makes a real Set lack `.delete`, and JavaScript's single-threaded async
-# concurrency cannot corrupt an object's shape either.
-#
-# It is also not reproducible off riscv64: the same lockfile and the same npm
-# 10.9.8 install cleanly on amd64. And it is intermittent. Two builds 20
-# minutes apart on an identical lockfile died 8.6s and 95.3s into the same
-# `npm ci`, and an earlier build of that same lockfile succeeded outright.
-#
-# `--predictable` disables parallel GC, which is the workaround already known
-# to fix V8 heap corruption on riscv64 (`vite build` hits it too). It costs
-# build time on this layer. It has to be passed to node directly because node
-# rejects it in NODE_OPTIONS ("--predictable is not allowed in NODE_OPTIONS"),
-# hence invoking npm-cli.js rather than the `npm` shim. Upstream wraps this
-# step in scripts/build/node-deps.mjs, which starts npm as a child process
-# without the flag, so the same `npm ci` arguments it builds are passed here
-# directly (ui-tui and web workspaces plus the root).
-#
-# `npm ci` is kept over `npm install` because it installs straight from
-# package-lock.json and does far less work than `npm install` reconciliation,
-# which narrows the window regardless of whether the GC theory holds.
-# amd64/arm64 need none of this, which is why the production Dockerfile can
-# use a plain `npm install`.
-RUN node --predictable /usr/local/lib/node_modules/npm/bin/npm-cli.js ci \
-        --no-audit --no-fund --engine-strict --include=dev --include=optional \
-        --include-workspace-root=true --workspace ui-tui --workspace web && \
-    node --predictable /usr/local/lib/node_modules/npm/bin/npm-cli.js cache clean --force
+# Upstream's own dependency script, same arguments as its frontend_build stage.
+# Up to v0.23.0 this step was a hand-written `npm ci` run under
+# `node --predictable`, because npm hit intermittent V8 heap corruption on the
+# riscv64 Node build ("set.delete is not a function", segfaults). pnpm runs on
+# the Node built into its own executable (v25.5.0), so that flag cannot reach
+# it; node-deps.mjs itself is still started with it. Measured on a Banana Pi F3
+# (SpaceMiT K1) before switching: see the commit message.
+RUN node --predictable scripts/build/node-deps.mjs --source /opt/hermes --workspace ui-tui --workspace web
 
 # ---------- Layer-cached Python dependency install ----------
 # riscv64: this is THE expensive, failure-prone layer. With no manylinux
@@ -305,7 +289,7 @@ COPY --chown=hermes:hermes . .
 
 # Terminal UI assets build natively: ui-tui uses esbuild, which has first-class
 # riscv64 support. Same product build as upstream's frontend_build stage, run
-# under --predictable for the V8 reason given at the npm ci step, then laid
+# under --predictable for the V8 heap-corruption reason given at the dependency install, then laid
 # over the source tree where upstream's runtime stage puts it.
 RUN node --predictable scripts/build/tui.mjs --source /opt/hermes --out /tmp/products/tui && \
     cp -a /tmp/products/tui/. /opt/hermes/ui-tui/ && \
