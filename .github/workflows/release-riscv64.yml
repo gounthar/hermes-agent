@@ -38,44 +38,11 @@ env:
   GHCR_IMAGE: ghcr.io/gounthar/hermes-agent
 
 jobs:
-  dashboard:
-    name: Build web dashboard (amd64)
+  version:
+    name: Resolve version and check it matches the code
     runs-on: ubuntu-latest
-    env:
-      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
-    steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Set up Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          # package.json requires node >=26 and .npmrc sets engine-strict.
-          # Same version as upstream's pm/lock.json.
-          node-version: "26.12.1"
-      - name: Build dashboard (vite outDir -> hermes_cli/web_dist)
-        # Upstream's own dependency and product scripts; the icons web.mjs
-        # reads in its no-argument mode are committed under web/public.
-        run: |
-          node scripts/build/node-deps.mjs --source "$GITHUB_WORKSPACE" --workspace web
-          node scripts/build/web.mjs
-      - name: Upload web_dist
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: web-dist
-          path: hermes_cli/web_dist/
-          if-no-files-found: error
-          retention-days: 7
-
-  image:
-    name: Build and push riscv64 image
-    needs: dashboard
-    # RISE's free, managed, native riscv64 runner. Requires the repo to be
-    # enrolled in the RISE runner program (the RISE GitHub App installed on
-    # this repo, see riseproject.dev); otherwise this label won't resolve.
-    # Native riscv64 is required: about 15 dependencies build from sdist
-    # (Rust and C++). v0.23.0 took 3 h 26 min on a Banana Pi F3 (SpaceMiT
-    # K1); under QEMU it would be many times that.
-    runs-on: ubuntu-24.04-riscv
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -102,12 +69,87 @@ jobs:
             exit 1
           fi
           echo "version=$v" >> "$GITHUB_OUTPUT"
+      - name: Require the upstream tag in this commit's history
+        # .upstream-version is bumped by updatecli on its own, before anyone
+        # merges the upstream code. Publishing then would tag the old code
+        # with the new version (it happened with 0.23.1 on 2026-11-10). So
+        # the upstream tag v<version> must be an ancestor of the commit being
+        # built. The compare API sees the fork network, so the tag's commit
+        # resolves here even though the fork does not carry upstream tags.
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Prefer the peeled commit (^{}) of an annotated tag over the tag object.
+          refs="$(git ls-remote https://github.com/NousResearch/hermes-agent.git "refs/tags/v${VERSION}" "refs/tags/v${VERSION}^{}")"
+          tag_sha="$(printf '%s\n' "$refs" | awk '$2 ~ /\^\{\}$/ {print $1; exit}')"
+          [ -z "$tag_sha" ] && tag_sha="$(printf '%s\n' "$refs" | awk 'NR==1 {print $1}')"
+          if [ -z "$tag_sha" ]; then
+            echo "::error::Upstream has no tag v${VERSION}"
+            exit 1
+          fi
+          status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${tag_sha}...${GITHUB_SHA}" --jq .status)"
+          echo "v${VERSION} is ${tag_sha}; ${GITHUB_SHA} is ${status} of it"
+          case "$status" in
+            ahead|identical) ;;
+            *)
+              echo "::error::v${VERSION} (${tag_sha}) is not in the history of ${GITHUB_SHA}; merge the upstream tag before publishing"
+              exit 1
+              ;;
+          esac
+
+  dashboard:
+    name: Build web dashboard (amd64)
+    needs: version
+    runs-on: ubuntu-latest
+    env:
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Set up Node and pnpm
+        # Upstream's own action: installs the node and pnpm pinned in
+        # pm/lock.json (package.json requires node >=26 and pnpm ^12, and
+        # pnpm-workspace.yaml sets engineStrict). Caches off, as in upstream's
+        # bootstrap-installer-build.yml.
+        uses: ./.github/actions/setup-pm
+        with:
+          toolchain: node
+          cache: false
+          cache-node: false
+      - name: Build dashboard (vite outDir -> hermes_cli/web_dist)
+        # Upstream's own dependency and product scripts; the icons web.mjs
+        # reads in its no-argument mode are committed under web/public.
+        run: |
+          node scripts/build/node-deps.mjs --source "$GITHUB_WORKSPACE" --workspace web
+          node scripts/build/web.mjs
+      - name: Upload web_dist
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: web-dist
+          path: hermes_cli/web_dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  image:
+    name: Build and push riscv64 image
+    needs: [version, dashboard]
+    # RISE's free, managed, native riscv64 runner. Requires the repo to be
+    # enrolled in the RISE runner program (the RISE GitHub App installed on
+    # this repo, see riseproject.dev); otherwise this label won't resolve.
+    # Native riscv64 is required: about 15 dependencies build from sdist
+    # (Rust and C++). v0.23.0 took 3 h 26 min on a Banana Pi F3 (SpaceMiT
+    # K1); under QEMU it would be many times that.
+    runs-on: ubuntu-24.04-riscv
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Write install stamp
         # Same stamp upstream's docker.yml writes before its build. Without
         # it the Dockerfile falls back to a placeholder and `hermes --version`
         # reports "vunknown". The RISE runner has no python3 on PATH.
         env:
-          VERSION: ${{ steps.ver.outputs.version }}
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           py="$(command -v python3 || echo /opt/python-3.12/bin/python3.12)"
           "$py" scripts/write_install_stamp.py --output install-stamp.json \
@@ -132,7 +174,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build image
         env:
-          VERSION: ${{ steps.ver.outputs.version }}
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           docker build -f Dockerfile.riscv64 \
             --build-arg HERMES_GIT_SHA="${GITHUB_SHA}" \
@@ -145,7 +187,7 @@ jobs:
         run: docker run --rm "${GHCR_IMAGE}:riscv64" --version
       - name: Push images
         env:
-          VERSION: ${{ steps.ver.outputs.version }}
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           docker push "${DOCKERHUB_IMAGE}:${VERSION}-riscv64"
           docker push "${DOCKERHUB_IMAGE}:riscv64"
@@ -153,7 +195,7 @@ jobs:
           docker push "${GHCR_IMAGE}:riscv64"
       - name: Summary
         env:
-          VERSION: ${{ steps.ver.outputs.version }}
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           {
             echo "### riscv64 image published";
